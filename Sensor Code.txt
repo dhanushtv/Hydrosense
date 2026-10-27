@@ -1,0 +1,263 @@
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <splash.h>
+#include <ESP32Servo.h> 
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h> 
+
+// --- Wi-Fi & AWS Cloud Credentials ---
+const char* ssid = "Fiza alle";          
+const char* password = "ummadeconcept";  
+const char* serverName = "https://qlkais3b69.execute-api.us-east-1.amazonaws.com/default/ProcessHydroponicsData";
+
+// --- Hardware Pins ---
+#define power_pin 15
+#define input_signal 32
+#define photoin 34
+#define reedswitch 26
+#define TdsSensorPin 33
+#define servoPin 13
+
+// --- Display Settings ---
+#define screen_width 128
+#define screen_height 64
+#define oled_reset -1
+#define screen_address 0x3c
+Adafruit_SH1106G display(screen_width, screen_height, &Wire, oled_reset);
+
+// --- Sensor Settings ---
+#define sealevelpreassure 1013.25
+Adafruit_BME280 bme;
+#define VREF 3.3              
+#define SCOUNT 30             
+
+// --- Servo & Pump Variables ---
+Servo valveServo;
+int basePosition = 90;   
+int value = 0;
+
+unsigned long pumpTimer = 0;
+int pumpState = 0; // 0=Idle/Check, 1=Pumping, 2=Settling
+
+unsigned long servoTimer = 0;
+bool isValveOpen = false;
+
+// --- Non-Blocking Timers ---
+unsigned long previousAWSMillis = 0;
+unsigned long previousOLEDMillis = 0;
+bool showPage1 = true;
+
+// --- TDS Median Filtering Algorithm ---
+int getMedianNum(int bArray[], int iFilterLen) {
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++)
+    bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  return bTemp;
+}
+
+void setup() {
+  Serial.begin(115200); 
+  analogSetAttenuation(ADC_11db);
+  
+  pinMode(power_pin, OUTPUT);
+  digitalWrite(power_pin, LOW);
+
+  pinMode(reedswitch, OUTPUT);
+  digitalWrite(reedswitch, HIGH); // Ensure pump is OFF on boot
+  
+  pinMode(TdsSensorPin, INPUT); 
+
+  // --- Wi-Fi Connection with Timeout ---
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nSUCCESS: Connected to Wi-Fi!");
+  } else {
+    Serial.println("\nWARNING: Wi-Fi connection failed. Proceeding in offline mode.");
+  }
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  valveServo.setPeriodHertz(50); 
+  valveServo.attach(servoPin, 500, 2400); 
+  valveServo.write(basePosition); // Lock valve at exactly 90 on boot
+
+  bool status = bme.begin(0x76);
+  if (!status) {
+    Serial.println("BME sensor is not responding, try again");
+  }
+  
+  if (!display.begin(screen_address, true)) {
+    Serial.println(F("SH110X allocation failed"));
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0,0);
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      display.print("Wi-Fi Connected!");
+    } else {
+      display.print("Offline Mode");
+    }
+    
+    display.display();
+    delay(2000);
+  }
+}
+
+void loop() {
+  // --- 1. CONTINUOUS SENSOR READING ---
+  digitalWrite(power_pin, HIGH);
+  delay(10);
+  value = analogRead(input_signal);
+  digitalWrite(power_pin, LOW);
+  int water_cm = map(value, 0, 4095, 0, 10);
+
+  float temp = bme.readTemperature();
+  float pressure = (bme.readPressure() / 100.0F);
+  float humidity = bme.readHumidity();
+
+  int rawvalue = analogRead(photoin);
+  int lightvalue = map(rawvalue, 0, 4095, 0, 100);
+
+  int analogBuffer[SCOUNT];
+  for(int i=0; i<SCOUNT; i++){
+    analogBuffer[i] = analogRead(TdsSensorPin);
+    delay(2); 
+  }
+  
+  float averageVoltage = getMedianNum(analogBuffer, SCOUNT) * (float)VREF / 4095.0;
+  float compensationCoefficient = 1.0 + 0.02 * (temp - 25.0);
+  float compensationVoltage = averageVoltage / compensationCoefficient;
+  
+  float tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
+
+  // --- 2. INDEPENDENT OLED REFRESH (Every 2 Seconds) ---
+  if (millis() - previousOLEDMillis >= 2000) {
+    previousOLEDMillis = millis();
+    display.clearDisplay();
+    display.setCursor(0,0);
+    
+    if (showPage1) {
+      display.print("Water (cm): "); display.println(water_cm);
+      display.setCursor(0,16); display.print("Temp: "); display.print(temp); display.println(" C");
+      display.setCursor(0,32); display.print("Pressure: "); display.println(pressure);
+      display.setCursor(0,48); display.print("Humidity: "); display.print(humidity); display.println(" %");
+    } else {
+      display.print("Light: "); display.print(lightvalue); display.println("%");
+      display.setCursor(0,16); display.print("TDS: "); display.print(tdsValue, 0); display.println(" ppm");
+    }
+    display.display();
+    showPage1 = !showPage1; 
+  }
+
+  // --- 3. PULSE WATER PUMP LOGIC ---
+  if (pumpState == 0) {
+    if (water_cm < 7) {
+      digitalWrite(reedswitch, LOW); 
+      pumpState = 1;
+      pumpTimer = millis();
+      Serial.println("Pump ON: Filling for 4 seconds...");
+    } else {
+      digitalWrite(reedswitch, HIGH); 
+    }
+  } 
+  else if (pumpState == 1) {
+    if (millis() - pumpTimer >= 4000) { 
+      digitalWrite(reedswitch, HIGH); 
+      pumpState = 2;
+      pumpTimer = millis();
+      Serial.println("Pump OFF: Settling water for 2 seconds...");
+    }
+  } 
+  else if (pumpState == 2) {
+    if (millis() - pumpTimer >= 2000) { 
+      pumpState = 0; 
+    }
+  }
+
+  // --- 4. INDEPENDENT SERVO CLOSING (1 Second exactly) ---
+  if (isValveOpen) {
+    if (millis() - servoTimer >= 1000) { 
+      valveServo.write(basePosition); // Returns EXACTLY to 90 to hard-brake the motor
+      isValveOpen = false;
+      Serial.println("Valve closed.\n");
+    }
+  }
+
+  // --- 5. AWS & SERVO OPEN TRIGGER (Every 30 Seconds) ---
+  if (millis() - previousAWSMillis >= 5000) { 
+    previousAWSMillis = millis();
+    
+    Serial.println("\n--- 30 SECOND TIMER TRIGGERED ---");
+    
+    // AWS Cloud Sync
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFiClientSecure client;
+      client.setInsecure(); 
+      HTTPClient http;
+      http.setTimeout(10000); 
+      http.begin(client, serverName);
+      http.addHeader("Content-Type", "application/json");
+
+      JsonDocument doc;
+      doc["device_id"] = "ESP32_Hydroponics";
+      doc["water_cm"] = water_cm;
+      doc["temp"] = temp;
+      doc["humidity"] = humidity;
+      doc["light_percent"] = lightvalue; 
+      doc["tds_ppm"] = tdsValue;         
+
+      String jsonString;
+      serializeJson(doc, jsonString);
+
+      int httpResponseCode = http.POST(jsonString);
+      if (httpResponseCode > 0) {
+        Serial.println("SUCCESS: AWS Cloud Sync OK. Code: " + String(httpResponseCode)); 
+      } else {
+        Serial.println("ERROR: AWS Cloud Sync Failed. Code: " + String(httpResponseCode));
+      }
+      http.end();
+    } else {
+      Serial.println("WARNING: WiFi Disconnected! Skipping AWS Sync.");
+    }
+
+    // Trigger Servo Open
+    Serial.println("Opening valve...");
+    valveServo.write(basePosition - 35); 
+    servoTimer = millis(); // Starts the 1-second precision stopwatch
+    isValveOpen = true;
+  }
+}

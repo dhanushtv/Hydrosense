@@ -1,0 +1,95 @@
+import json
+import boto3
+import datetime
+from decimal import Decimal
+from boto3.dynamodb.conditions import Key
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('HydroponicsTelemetry')
+sns = boto3.client('sns')
+
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:418606469545:HydroponicsAlerts'
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj) if obj % 1 != 0 else int(obj)
+        return super(DecimalEncoder, self).default(obj)
+
+def lambda_handler(event, context):
+    print("Received event: ", json.dumps(event))
+    
+    # 1. HANDLE GET REQUESTS (Streamlit Dashboard)
+    http_method = event.get('httpMethod', 'POST')
+    if 'requestContext' in event and 'http' in event['requestContext']:
+        http_method = event['requestContext']['http'].get('method', 'POST')
+        
+    if http_method == 'GET':
+        response = table.query(
+            KeyConditionExpression=Key('device_id').eq('ESP32_Hydroponics'),
+            ScanIndexForward=False,
+            Limit=50
+        )
+        items = response.get('Items', [])
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': '*'
+            },
+            'body': json.dumps(items, cls=DecimalEncoder)
+        }
+        
+    # 2. HANDLE POST REQUESTS (ESP32 Telemetry)
+    body = event
+    if 'body' in event:
+        try:
+            body = json.loads(event['body'])
+        except Exception:
+            body = event['body']
+            
+    device_id = body.get('device_id', 'ESP32_Hydroponics')
+    water_cm = body.get('water_cm', 0)
+    temp = body.get('temp', 0.0)
+    humidity = body.get('humidity', 0.0)
+    light_percent = body.get('light_percent', 0)
+    tds_ppm = body.get('tds_ppm', 0)
+    
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # 3. DIRECT WRITE TO DYNAMODB (EVERY 5 SECONDS)
+    table.put_item(
+        Item={
+            'device_id': device_id,
+            'timestamp': timestamp,
+            'water_cm': Decimal(str(water_cm)),
+            'temp': Decimal(str(temp)),
+            'humidity': Decimal(str(humidity)),
+            'light_percent': Decimal(str(light_percent)),
+            'tds_ppm': Decimal(str(tds_ppm))
+        }
+    )
+    print("5-second telemetry logged to DynamoDB.")
+
+    # 4. CRITICAL SNS ALERT LOGIC (SAFE FLOAT PARSING & ERROR HANDLING)
+    try:
+        water_level_val = float(water_cm)
+        if water_level_val <= 1.0:
+            message = f"ALERT: Hydroponics water level is critically low ({water_cm} cm) at {timestamp}!"
+            response = sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=message,
+                Subject='Hydroponics System Warning'
+            )
+            print(f"SNS Alert sent successfully! MessageId: {response.get('MessageId')}")
+    except Exception as e:
+        print(f"ERROR executing SNS Alert: {e}")
+
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*'
+        },
+        'body': json.dumps('Data processed successfully!')
+    }
